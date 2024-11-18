@@ -23,7 +23,7 @@ fn fibonacci_sequence(num_iter: u16) -> u16{
 }
 
 fn fibonacci_sequence_recursive(num_iter: u32, start: u32, next: u32) -> u32 {
-    if num_iter == 1 {
+    if num_iter <= 1 {
         return next;
     }
     fibonacci_sequence_recursive(num_iter - 1, next, start + next)
