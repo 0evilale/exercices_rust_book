@@ -1,4 +1,5 @@
 pub mod screen;
+pub mod test;
 
 use std::sync::mpsc::SyncSender;
 

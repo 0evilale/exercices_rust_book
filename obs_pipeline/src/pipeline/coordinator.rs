@@ -10,7 +10,6 @@ use crate::output::file_output::FileRecorder;
 use crate::preview::renderer::PreviewEvent;
 use crate::scene::compositor::Compositor;
 use crate::scene::{Scene, SceneItem, SourceId, Transform};
-use crate::source::screen::ScreenCaptureSource;
 use crate::source::VideoSource;
 use crate::types::VideoFrame;
 
@@ -31,8 +30,8 @@ pub struct PipelineConfig {
 impl Default for PipelineConfig {
     fn default() -> Self {
         PipelineConfig {
-            canvas_width: 1920,
-            canvas_height: 1080,
+            canvas_width: 1280,
+            canvas_height: 720,
             fps: 30,
             record_path: None,
             record_bitrate_kbps: None,
@@ -45,9 +44,9 @@ impl Default for PipelineConfig {
 /// Thread layout with recording enabled:
 ///
 /// ```text
-/// [ScreenCapture] --VideoFrame--> [Compositor] ──┬── Arc<VideoFrame> ──> [Preview (main)]
-///                                                │
-///                                                └── VideoFrame ────────> [Recorder]
+/// [VideoSource] --VideoFrame--> [Compositor] ──┬── Arc<VideoFrame> ──> [Preview (main)]
+///                                              │
+///                                              └── VideoFrame ────────> [Recorder]
 /// ```
 pub struct Pipeline {
     compositor_thread: Option<thread::JoinHandle<()>>,
@@ -57,11 +56,16 @@ pub struct Pipeline {
 }
 
 impl Pipeline {
+    /// Start the pipeline using the provided video source.
+    ///
+    /// The caller constructs whichever `VideoSource` impl is appropriate
+    /// (`ScreenCaptureSource`, `TestSource`, etc.) and passes it here.
     pub fn start(
         config: PipelineConfig,
+        mut source: Box<dyn VideoSource>,
         proxy: EventLoopProxy<PreviewEvent>,
     ) -> (Self, Receiver<Arc<VideoFrame>>) {
-        // ── Channel: screen capture → compositor ──────────────────────────────
+        // ── Channel: video source → compositor ───────────────────────────────
         let (capture_tx, capture_rx) = mpsc::sync_channel::<VideoFrame>(CHANNEL_DEPTH);
 
         // ── Channel: compositor → preview renderer ────────────────────────────
@@ -78,9 +82,7 @@ impl Pipeline {
 
                 let handle = thread::Builder::new()
                     .name("obs-recorder".into())
-                    .spawn(move || {
-                        recorder_loop(record_rx, path, width, height, fps, bitrate);
-                    })
+                    .spawn(move || recorder_loop(record_rx, path, width, height, fps, bitrate))
                     .expect("Failed to spawn recorder thread");
 
                 (Some(record_tx), Some(handle))
@@ -88,7 +90,23 @@ impl Pipeline {
             None => (None, None),
         };
 
-        // ── Build scene with a single full-screen source ──────────────────────
+        // ── Start the video source ─────────────────────────────────────────────
+        let source_name = source.name().to_string();
+        if let Err(e) = source.start(capture_tx.clone()) {
+            error!("{source_name} failed to start: {e}");
+        }
+
+        // Keep the source alive until the pipeline stops.
+        thread::Builder::new()
+            .name("obs-source-guard".into())
+            .spawn(move || {
+                // Source runs its own internal thread; this guard thread just
+                // owns the source struct so it isn't dropped prematurely.
+                drop(source);
+            })
+            .expect("Failed to spawn source guard");
+
+        // ── Build scene ───────────────────────────────────────────────────────
         let source_id = SourceId(0);
         let mut scene = Scene::new("Main", config.canvas_width, config.canvas_height);
         scene.add_item(SceneItem {
@@ -105,34 +123,13 @@ impl Pipeline {
         let compositor_thread = thread::Builder::new()
             .name("obs-compositor".into())
             .spawn(move || {
-                compositor_loop(
-                    capture_rx,
-                    preview_tx,
-                    record_tx_for_thread,
-                    proxy,
-                    compositor,
-                    source_id,
-                    fps,
-                )
+                compositor_loop(capture_rx, preview_tx, record_tx_for_thread, proxy, compositor, source_id, fps)
             })
             .expect("Failed to spawn compositor thread");
 
-        // ── Start screen capture source ───────────────────────────────────────
-        let capture_tx_clone = capture_tx.clone();
-        let mut screen_src = ScreenCaptureSource::new(0, fps);
-        if let Err(e) = screen_src.start(capture_tx_clone) {
-            error!("ScreenCaptureSource failed to start: {e}");
-        }
-
-        // Keep the source alive for the lifetime of the process. We detach it
-        // here; dropping the capture_tx from `stop()` will unblock its loop.
-        thread::Builder::new()
-            .name("obs-screen-src-guard".into())
-            .spawn(move || drop(screen_src))
-            .expect("Failed to spawn source guard");
-
         info!(
-            "Pipeline started ({}×{} @ {} fps, recording: {})",
+            "Pipeline started: source={} {}×{} @ {} fps recording={}",
+            source_name,
             config.canvas_width,
             config.canvas_height,
             fps,
@@ -149,12 +146,10 @@ impl Pipeline {
     }
 
     pub fn stop(mut self) {
-        // Drop the capture tx so the compositor loop exits once its channel drains.
         drop(self.capture_tx);
         if let Some(t) = self.compositor_thread.take() {
             let _ = t.join();
         }
-        // Drop the record tx so the recorder loop finalizes the MP4.
         drop(self.record_tx);
         if let Some(t) = self.recorder_thread.take() {
             let _ = t.join();
@@ -185,7 +180,6 @@ fn compositor_loop(
         let composed = compositor.composite(pts);
         let composed_arc = Arc::new(composed.clone());
 
-        // Forward to preview (drop if behind)
         match preview_tx.try_send(Arc::clone(&composed_arc)) {
             Ok(_) => {}
             Err(mpsc::TrySendError::Full(_)) => {}
@@ -195,15 +189,14 @@ fn compositor_loop(
             }
         }
 
-        // Forward to recorder (block to preserve every frame)
+        // Block on send to recorder so no frames are dropped from the recording.
         if let Some(tx) = &record_tx {
             if let Err(e) = tx.send(composed) {
-                warn!("Record channel send failed: {e} — stopping compositor");
+                warn!("Record channel send failed: {e}");
                 break;
             }
         }
 
-        // Wake the winit event loop.
         if proxy.send_event(PreviewEvent::NewFrame).is_err() {
             info!("Event loop proxy disconnected — stopping compositor");
             break;
@@ -227,7 +220,6 @@ fn recorder_loop(
         Ok(r) => r,
         Err(e) => {
             error!("Failed to create FileRecorder: {e}");
-            // Drain the channel so the compositor doesn't block forever.
             for _ in rx.iter() {}
             return;
         }

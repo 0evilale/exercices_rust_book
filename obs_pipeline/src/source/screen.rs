@@ -95,6 +95,25 @@ impl VideoSource for ScreenCaptureSource {
 // ── Capture loop (runs on its own thread) ────────────────────────────────────
 
 fn capture_loop(tx: SyncSender<VideoFrame>, running: Arc<AtomicBool>, fps: u32) {
+    // scap can panic internally on unsupported platforms (e.g. WSL2 without
+    // a proper XDG Desktop Portal). Wrap in catch_unwind so the thread exits
+    // cleanly instead of aborting the process.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        capture_loop_inner(tx, running, fps)
+    }));
+    if let Err(payload) = result {
+        let msg = payload
+            .downcast_ref::<String>()
+            .map(|s| s.as_str())
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("unknown panic");
+        error!("Screen capture thread panicked: {msg}");
+        error!("Hint: screen capture is not supported in WSL2 without XDG Desktop Portal.");
+        error!("Try running with --source test for a synthetic test pattern.");
+    }
+}
+
+fn capture_loop_inner(tx: SyncSender<VideoFrame>, running: Arc<AtomicBool>, fps: u32) {
     let options = Options {
         fps,
         output_resolution: Resolution::Captured,
@@ -103,7 +122,6 @@ fn capture_loop(tx: SyncSender<VideoFrame>, running: Arc<AtomicBool>, fps: u32) 
         ..Default::default()
     };
 
-    // `Capturer::build` validates permissions and returns Result.
     let mut capturer = match Capturer::build(options) {
         Ok(c) => c,
         Err(e) => {
