@@ -15,6 +15,9 @@ scap = "0.0.8"
 winit = "0.30"
 softbuffer = "0.4"
 
+# Video/audio encoding + muxing via system FFmpeg
+ffmpeg-next = "7"
+
 # Error types
 thiserror = "1"
 

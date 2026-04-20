@@ -1,16 +1,18 @@
+mod encoder;
+mod output;
 mod pipeline;
 mod preview;
 mod scene;
 mod source;
 mod types;
 
+use std::path::PathBuf;
+
 use pipeline::coordinator::{Pipeline, PipelineConfig};
-use preview::renderer::{PreviewApp, create_event_loop};
+use preview::renderer::{create_event_loop, PreviewApp};
 use tracing::info;
 
-
 fn main() {
-    // ── Logging ───────────────────────────────────────────────────────────────
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -20,29 +22,43 @@ fn main() {
 
     info!("obs_pipeline starting up");
 
-    // ── winit event loop (must be created on the main thread) ─────────────────
+    // winit event loop (main thread).
     let (event_loop, proxy) = create_event_loop();
 
-    // ── Pipeline config ───────────────────────────────────────────────────────
+    // Parse very minimal CLI: `cargo run -- --record out.mp4`.
+    let record_path = parse_record_path();
+
     let config = PipelineConfig {
-        canvas_width: 1920,
-        canvas_height: 1080,
+        canvas_width: 1280,
+        canvas_height: 720,
         fps: 30,
+        record_path: record_path.clone(),
+        record_bitrate_kbps: Some(4_000),
     };
 
-    // ── Start pipeline threads ────────────────────────────────────────────────
     let (pipeline, preview_rx) = Pipeline::start(config, proxy);
 
-    // ── Preview application ───────────────────────────────────────────────────
-    let mut app = PreviewApp::new(preview_rx, "OBS Pipeline (Rust) — Press Q to quit");
+    let title = match &record_path {
+        Some(p) => format!("OBS Pipeline — recording → {} — Q to stop", p.display()),
+        None => "OBS Pipeline — Q to quit".to_string(),
+    };
+    let mut app = PreviewApp::new(preview_rx, title);
 
-    // ── Run event loop on main thread (blocks until window is closed) ─────────
     event_loop
         .run_app(&mut app)
         .expect("Event loop error");
 
-    // ── Shutdown ──────────────────────────────────────────────────────────────
     info!("Shutting down pipeline…");
     pipeline.stop();
     info!("Goodbye!");
+}
+
+fn parse_record_path() -> Option<PathBuf> {
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        if a == "--record" || a == "-r" {
+            return args.next().map(PathBuf::from);
+        }
+    }
+    None
 }

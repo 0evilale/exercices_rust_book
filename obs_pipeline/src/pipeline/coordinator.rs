@@ -1,10 +1,12 @@
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::Arc;
 use std::thread;
 
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use winit::event_loop::EventLoopProxy;
 
+use crate::output::file_output::FileRecorder;
 use crate::preview::renderer::PreviewEvent;
 use crate::scene::compositor::Compositor;
 use crate::scene::{Scene, SceneItem, SourceId, Transform};
@@ -12,19 +14,18 @@ use crate::source::screen::ScreenCaptureSource;
 use crate::source::VideoSource;
 use crate::types::VideoFrame;
 
-/// Buffer depth for the inter-thread channels.
-/// A depth of 4 means: hold at most 4 frames in flight before backpressure kicks in.
 const CHANNEL_DEPTH: usize = 4;
 
 /// Top-level pipeline configuration.
 #[derive(Debug, Clone)]
 pub struct PipelineConfig {
-    /// Output canvas width in pixels.
     pub canvas_width: u32,
-    /// Output canvas height in pixels.
     pub canvas_height: u32,
-    /// Target frames per second.
     pub fps: u32,
+    /// Optional MP4 recording output.
+    pub record_path: Option<PathBuf>,
+    /// Bitrate for the recording encoder, in kbps.
+    pub record_bitrate_kbps: Option<usize>,
 }
 
 impl Default for PipelineConfig {
@@ -33,35 +34,29 @@ impl Default for PipelineConfig {
             canvas_width: 1920,
             canvas_height: 1080,
             fps: 30,
+            record_path: None,
+            record_bitrate_kbps: None,
         }
     }
 }
 
-/// Owns and coordinates all pipeline threads.
+/// Owns the running pipeline.
 ///
-/// Thread layout (Phase 1 — MVP):
+/// Thread layout with recording enabled:
 ///
 /// ```text
-/// [ScreenCaptureThread] --VideoFrame--> [CompositorThread]
-///                                              |
-///                                    Arc<VideoFrame>
-///                                              |
-///                                       [PreviewThread ← winit event loop on main thread]
+/// [ScreenCapture] --VideoFrame--> [Compositor] ──┬── Arc<VideoFrame> ──> [Preview (main)]
+///                                                │
+///                                                └── VideoFrame ────────> [Recorder]
 /// ```
 pub struct Pipeline {
-    config: PipelineConfig,
-    /// Handle to the compositor thread.
     compositor_thread: Option<thread::JoinHandle<()>>,
-    /// Sender used to push raw frames from the screen capture source.
+    recorder_thread: Option<thread::JoinHandle<()>>,
     capture_tx: SyncSender<VideoFrame>,
+    record_tx: Option<SyncSender<VideoFrame>>,
 }
 
 impl Pipeline {
-    /// Build and start the pipeline.
-    ///
-    /// Returns the `Pipeline` handle together with:
-    /// * `preview_rx` — the receiver the winit event loop reads composed frames from.
-    /// * `proxy`      — used to send `PreviewEvent::NewFrame` to wake the event loop.
     pub fn start(
         config: PipelineConfig,
         proxy: EventLoopProxy<PreviewEvent>,
@@ -72,7 +67,28 @@ impl Pipeline {
         // ── Channel: compositor → preview renderer ────────────────────────────
         let (preview_tx, preview_rx) = mpsc::sync_channel::<Arc<VideoFrame>>(CHANNEL_DEPTH);
 
-        // ── Build scene with a single full-screen source ───────────────────────
+        // ── Optional channel: compositor → recorder ───────────────────────────
+        let (record_tx_opt, recorder_thread) = match config.record_path.clone() {
+            Some(path) => {
+                let (record_tx, record_rx) = mpsc::sync_channel::<VideoFrame>(CHANNEL_DEPTH);
+                let width = config.canvas_width;
+                let height = config.canvas_height;
+                let fps = config.fps;
+                let bitrate = config.record_bitrate_kbps;
+
+                let handle = thread::Builder::new()
+                    .name("obs-recorder".into())
+                    .spawn(move || {
+                        recorder_loop(record_rx, path, width, height, fps, bitrate);
+                    })
+                    .expect("Failed to spawn recorder thread");
+
+                (Some(record_tx), Some(handle))
+            }
+            None => (None, None),
+        };
+
+        // ── Build scene with a single full-screen source ──────────────────────
         let source_id = SourceId(0);
         let mut scene = Scene::new("Main", config.canvas_width, config.canvas_height);
         scene.add_item(SceneItem {
@@ -81,17 +97,18 @@ impl Pipeline {
             visible: true,
             z_order: 0,
         });
-
-        let mut compositor = Compositor::new(scene);
+        let compositor = Compositor::new(scene);
         let fps = config.fps;
 
         // ── Compositor thread ─────────────────────────────────────────────────
+        let record_tx_for_thread = record_tx_opt.clone();
         let compositor_thread = thread::Builder::new()
             .name("obs-compositor".into())
             .spawn(move || {
                 compositor_loop(
                     capture_rx,
                     preview_tx,
+                    record_tx_for_thread,
                     proxy,
                     compositor,
                     source_id,
@@ -107,34 +124,39 @@ impl Pipeline {
             error!("ScreenCaptureSource failed to start: {e}");
         }
 
-        // Move source into a thread so its `stop()` can be called on shutdown.
+        // Keep the source alive for the lifetime of the process. We detach it
+        // here; dropping the capture_tx from `stop()` will unblock its loop.
         thread::Builder::new()
             .name("obs-screen-src-guard".into())
-            .spawn(move || {
-                // This thread just holds the source alive until drop.
-                // The capture loop is internal to ScreenCaptureSource.
-                drop(screen_src);
-            })
-            .expect("Failed to spawn source guard thread");
+            .spawn(move || drop(screen_src))
+            .expect("Failed to spawn source guard");
 
-        info!("Pipeline started ({}×{} @ {} fps)", config.canvas_width, config.canvas_height, fps);
+        info!(
+            "Pipeline started ({}×{} @ {} fps, recording: {})",
+            config.canvas_width,
+            config.canvas_height,
+            fps,
+            config.record_path.is_some()
+        );
 
         let pipeline = Pipeline {
-            config,
             compositor_thread: Some(compositor_thread),
+            recorder_thread,
             capture_tx,
+            record_tx: record_tx_opt,
         };
-
         (pipeline, preview_rx)
     }
 
-    /// Stop the pipeline gracefully.
     pub fn stop(mut self) {
-        // Dropping capture_tx signals the compositor thread to exit when the
-        // channel becomes empty and the sender is gone.
+        // Drop the capture tx so the compositor loop exits once its channel drains.
         drop(self.capture_tx);
-
         if let Some(t) = self.compositor_thread.take() {
+            let _ = t.join();
+        }
+        // Drop the record tx so the recorder loop finalizes the MP4.
+        drop(self.record_tx);
+        if let Some(t) = self.recorder_thread.take() {
             let _ = t.join();
         }
         info!("Pipeline stopped");
@@ -146,6 +168,7 @@ impl Pipeline {
 fn compositor_loop(
     capture_rx: Receiver<VideoFrame>,
     preview_tx: SyncSender<Arc<VideoFrame>>,
+    record_tx: Option<SyncSender<VideoFrame>>,
     proxy: EventLoopProxy<PreviewEvent>,
     mut compositor: Compositor,
     source_id: SourceId,
@@ -154,27 +177,33 @@ fn compositor_loop(
     let mut frame_number: u64 = 0;
 
     for raw_frame in &capture_rx {
-        // Update cache for the single source.
         compositor.update_source(source_id, raw_frame);
 
         let pts = crate::types::Timestamp::from_frame(frame_number, fps);
         frame_number += 1;
 
-        // Composite all scene items into one frame.
         let composed = compositor.composite(pts);
-        let composed = Arc::new(composed);
+        let composed_arc = Arc::new(composed.clone());
 
-        // Forward to the preview renderer; drop if the buffer is full (frame skip).
-        match preview_tx.try_send(Arc::clone(&composed)) {
+        // Forward to preview (drop if behind)
+        match preview_tx.try_send(Arc::clone(&composed_arc)) {
             Ok(_) => {}
-            Err(mpsc::TrySendError::Full(_)) => {} // preview is behind — skip
+            Err(mpsc::TrySendError::Full(_)) => {}
             Err(mpsc::TrySendError::Disconnected(_)) => {
                 info!("Preview channel disconnected — stopping compositor");
                 break;
             }
         }
 
-        // Wake the winit event loop so it issues a RedrawRequested.
+        // Forward to recorder (block to preserve every frame)
+        if let Some(tx) = &record_tx {
+            if let Err(e) = tx.send(composed) {
+                warn!("Record channel send failed: {e} — stopping compositor");
+                break;
+            }
+        }
+
+        // Wake the winit event loop.
         if proxy.send_event(PreviewEvent::NewFrame).is_err() {
             info!("Event loop proxy disconnected — stopping compositor");
             break;
@@ -182,4 +211,36 @@ fn compositor_loop(
     }
 
     info!("Compositor loop finished");
+}
+
+// ── Recorder loop ─────────────────────────────────────────────────────────────
+
+fn recorder_loop(
+    rx: Receiver<VideoFrame>,
+    path: PathBuf,
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate_kbps: Option<usize>,
+) {
+    let mut recorder = match FileRecorder::new(&path, width, height, fps, bitrate_kbps) {
+        Ok(r) => r,
+        Err(e) => {
+            error!("Failed to create FileRecorder: {e}");
+            // Drain the channel so the compositor doesn't block forever.
+            for _ in rx.iter() {}
+            return;
+        }
+    };
+
+    for frame in &rx {
+        if let Err(e) = recorder.push_frame(&frame) {
+            warn!("push_frame failed: {e}");
+        }
+    }
+
+    if let Err(e) = recorder.finalize() {
+        error!("FileRecorder finalise failed: {e}");
+    }
+    info!("Recorder loop finished");
 }
